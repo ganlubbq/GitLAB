@@ -1,0 +1,109 @@
+function Sift( this )
+%SIFT Summary of this function goes here
+%   Detailed explanation goes here
+%
+% % If we don't have at least 10 extrema, don't bother interpolating
+% % yet. If we have less than 16, "make some up" by mirroring the
+% % early extrema back in time.
+% target_min_t = [];
+% target_max_t = [];
+% num_extrema = numel ( [this.source_max_t, this.source_min_t] );
+% if ( num_extrema < 10 )
+%     return;
+% elseif (num_extrema < 16)
+%     % Mirror some extrema.
+%     first_extr_time = min ([this.source_max_t, this.source_min_t]);
+%     if ( first_extr_time == this.source_max_t(1) )
+%         first_extr_type = 'max';
+%     else
+%         first_extr_type = 'min';
+%     end
+%
+%
+%
+%
+% else
+%     % Take last 6 extrema
+% end
+%
+    max_t = this.source_max_t;
+    min_t = this.source_min_t;
+    max_v = this.source_max_v;
+    min_v = this.source_min_v;
+    x = this.data_source.Get(1);
+    [m_max_t, m_max_v, m_min_t, m_min_v] = Mirror_Left_Extrema(max_t, max_v, min_t, min_v, x)
+    
+    figure (42);
+    axes; hold on;
+    plot(m_max_t,m_max_v,'bo',m_min_t,m_min_v,'ro');
+    
+
+    function [m_max_t, m_max_v, m_min_t, m_min_v] = Mirror_Left_Extrema(max_t, max_v, min_t, min_v, x)
+        % This function is called when the extrema do not cover the time origin,
+        % and we need to 'invent' some by mirroring the extrema we already have.
+        %
+        % Arguments:
+        %   * max_t, max_v: times and magnitudes of maxima that we know about.
+        %                   i.e. "CurIndMaxima"
+        %   * min_t, min_v: times and magnitudes of minima that we know about.
+        %                   i.e. "CurIndMinima"
+        %   * x: Original signal (array), starting at t=1. (Can modify this
+        %   using t0.)
+        %
+        % Returns:
+        %    The original minima/maxima arrays, with NBSYM pairs of extrema
+        %    reflected around the time origin and appended to the left.
+        % 
+
+        % Number of minima-maxima pairs to reflect around the time origin.
+        NBSYM = 2;
+        
+        if (~exist('t0','var')) t0 = 1; end;
+        
+        % The idea for this section copied from Rilling, Goncalves, and
+        % Flandrin's online_emd.m.
+        first_extrema_time = min ( [max_t min_t] );
+        if ( first_extrema_time == max_t(1) )
+            assert ( x(1) <= max_v(1), 'Something impossible happened - signal detected to be decreasing towards the first local maxima. bug?');
+            % First extrema was a maximum, i.e. the signal was increasing at
+            % time 0. Assume that the signal had a local minima at time = 0.
+            % I.e. signal looked like:
+            %   _______
+            %  /
+            % /
+            %
+            lmax    = fliplr(max_t(1:min(end,NBSYM)));
+            m_max_v = fliplr(max_v(1:min(end,NBSYM)))
+            lmin    = [fliplr(min_t(1:min(end,NBSYM-1))), 1];
+            m_min_v = [fliplr(min_v(1:min(end,NBSYM-1))), x(1)]
+            mirror_time = 1;
+        else
+            assert ( x(1) >= min_v(1), 'Something impossible happened - signal detected to be increasing towards the first local minima. bug?');
+            % First extrema was a minimum, and the signal was decreasing at
+            % time 0. Assume the signal had a local maxima at time = 0.
+            % I.e. signal looked like:
+            % \
+            %  \
+            %   \____
+            %
+            lmax    = [ fliplr(max_t(1:min(end,NBSYM-1))) 1 ];
+            m_max_v = [ fliplr(max_v(1:min(end,NBSYM-1))) x(1) ]
+            lmin    = fliplr(min_t(1:min(end,NBSYM)));
+            m_min_v = fliplr(min_v(1:min(end,NBSYM)))
+            mirror_time = 1;
+        end
+        % Okay. We just picked some maxima and minima to reflect around the time
+        % origin. Now reflect their time coordinates.
+        m_max_t = (mirror_time*2) - lmax;
+        m_min_t = (mirror_time*2) - lmin;        
+      
+        % Append the mirrored extrema to the beginning of the lists.
+        m_max_t = [ m_max_t max_t ]; assert ( numel(unique(m_max_t)) == numel (m_max_t) );
+        m_min_t = [ m_min_t min_t ]; assert ( numel(unique(m_min_t)) == numel (m_min_t) );
+        m_max_v = [ m_max_v max_v ]; assert ( numel(m_max_v) == numel (m_max_t) );
+        m_min_v = [ m_min_v min_v ]; assert ( numel(m_min_v) == numel (m_min_t) );
+        
+        % Co
+        
+    end % End function Mirror_Left_Extrema.
+end

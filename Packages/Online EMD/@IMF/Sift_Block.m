@@ -1,0 +1,469 @@
+function Sift_Block( this )
+
+if ( this.config('IMF:SIFT_BLOCK:DEBUG:PROGRESS_OUTPUT') )
+    fprintf ('Beginning sifting run for IMF #%i\n',this.mode_num);
+    tic
+end
+
+% Code conventions:
+% variables in CAPS are constant parameters.
+
+%% Constants
+NUM_EXTREMA_PRECEDING  = this.config('IMF:SIFT_BLOCK:NUM_EXTREMA_PRECEDING');  % Include this many previous extrema to the left of the search zone - pads out the end effects.
+NUM_SIFTING_ITERATIONS = this.config('IMF:SIFT_BLOCK:NUM_SIFTING_ITERATIONS'); % This implementation uses  When computing new blocks of IMF, perform this many iterations of the sifting procedure.
+RIGHT_TRIM_NUMEXTR     = this.config('IMF:SIFT_BLOCK:NUM_RIGHT_TRIM_EXTR');
+
+%% Will we actually have enough data to calculate with?
+if (this.data_source.Latest == 0)
+    return; % Our data source has no data yet.
+end
+
+%% Define the IMF calculation region (including overlap with last calculation.)
+% Setting the right bound is easy. Just put it as far right as possible.
+right_bound = this.data_source.Latest;
+
+% Setting the left bound is a bit trickier.
+% Because the interpolation process is inaccurate at the ends, we have to throw
+% out the first bit of the block. This means there needs to be some overlap with
+% the last block we calculated.
+%
+% We overlap by "10 extrema".
+%
+% Obtain 10 extrema immediately preceding this.n_latest (which is where we got
+% up to last time we were computing the IMF.)
+extrema_times = sort ( [this.source_max_t, this.source_min_t] );
+prev_extrema_times = extrema_times( extrema_times < this.Latest );
+
+% If there were no extrema preceding....
+if ( numel(prev_extrema_times) < NUM_EXTREMA_PRECEDING)
+    left_bound = 1;
+else
+    left_bound = prev_extrema_times(end-NUM_EXTREMA_PRECEDING+1);
+end
+
+% Sanity check
+if ( left_bound < this.data_source.Earliest )
+    warning('IMF_Newblock() - left IMF computation bound set too far left - the data source doesn''t go back that far in history.');
+    left_bound = this.data_source.Earliest;
+end
+
+% DEBUGGING ONLY
+if ( this.config('IMF:SIFT_BLOCK:DEBUG:USE_ALL_HISTORIC_DATA') )
+    left_bound = max(this.data_source.Earliest,1);
+end
+
+% More sanity checks
+assert ( left_bound > 0 && right_bound > 0 );
+assert ( left_bound <= right_bound, 'Calculating IMF over an invalid interval - left bound and right bound are the wrong way around! Aborting.');
+
+%% Get data to work on:
+offset = left_bound - 1;
+x = this.GetSourceData(left_bound, right_bound);
+if ( left_bound == right_bound )
+    fprintf('Didn''t get any new data, skipping this IMF update run\n');
+    return;
+end
+assert ( ~isempty(x), 'Got no new data! What do you expect me to do?');
+xlen = numel(x);
+
+%% Sifting process - compute IMF.
+d = zeros(NUM_SIFTING_ITERATIONS+1,xlen); % Preallocate for speed
+d(1,:) = x;
+spline_t = 1:xlen;
+MIN_EXTREMA = 10;
+for n = 1:NUM_SIFTING_ITERATIONS
+    [imin, imax, ~] = extr (d(n,:));
+    vmin = d(n,imin);
+    vmax = d(n,imax);
+    
+    % Need copies of these for later, when we decide where to trim.
+    imin_copy = imin;
+    imax_copy = imax;
+    
+    % Verify that the data are sane. These should never trigger.
+    assert( numel(imin) == numel(unique(imin)) );
+    assert( numel(imax) == numel(unique(imax)) );
+    assert( numel(imin) == numel (vmin) );
+    assert( numel(imax) == numel (vmax) );
+    
+    % Is there enough data to bother sifting?
+    if ( numel(imin) < MIN_EXTREMA || numel(imax) < MIN_EXTREMA )
+        return; % We'll retry when there's more data available.
+    end
+    
+    if ( this.config('IMF:SIFT_BLOCK:MIRRORISE_EXTREMA') )
+        Mirrorize_Extrema();
+    end
+    
+    env_min = Interpolate(imin,vmin,spline_t,this);
+    env_max = Interpolate(imax,vmax,spline_t,this);
+    env_mean = ( env_min + env_max ) ./ 2;
+    d(n+1,:) = d(n,:) - env_mean;
+    
+    if ( this.config('IMF:SIFT_BLOCK:DEBUG:DISPLAY_EACH_SIFTING_ITERATION') )
+        Debug_Show_Sifting_Step();
+    end
+    
+    % --------------------------------------------------------------------------
+    % As stated above, we assume that 4-10 sifting iterations will be sufficient
+    % to obtain a meaningful IMF, so we just fix the number of sifting
+    % iterations beforehand. This is the approach taken by (for example)
+    % Chappell and Flandrin/Rilling/Goncalves.
+    %
+    % Here the number of sifting iterations MUST be fixed to avoid
+    % discontinuities between blocks. So don't change this.
+    % --------------------------------------------------------------------------
+    
+end % Done sifting.
+
+mode = d(n+1,:); % Last iteration of d(t) is the IMF.
+res  = x - mode; % Last iteration of m(t) is the residue.
+% Note that d(t) + m(t) yields original input x(t).
+assert( numel(this.mode) == numel (this.residue), 'LwsEMD:Logical_Error','This should never happen.' );
+
+%% Trim to size.
+% The spline interpolation procedure has nasty end effects - luckily for
+% Hermite interpolation, these are strictly limited to the first and last
+% interpolation intervals.
+if  ( numel(prev_extrema_times) == 0 )
+    trim_left = 1;
+else
+    % ???????????????????????????????????????
+    % SHOULD BE: Trim so that we add from where we got up to last time?????
+    %
+    % Found and fixed a bug. Was:
+    %
+    % trim_left = this.Latest - left_bound + 1;
+    %
+    % Turns out this introdcues a slight phase shift into the first IMF...
+    %
+    % ... Which then introduces discontinuities into the first IMF...
+    %
+    % ... Which then plays absolute havoc when those discontinuities are
+    % detected as local extrema for the second IMF...
+    %
+    %           left_bound   this.Latest
+    %                 vv       vv
+    % ...+--+--+--+--+--+--+--+--+
+    % ...|11|12|13|14|15|16|17|18|                    (EXISTING)
+    % ...+--+--+--+--+--+--+--+--+
+    %
+    %                |--OVERLAP--|
+    %
+    %                +--+--+--+--+--+--+--+--+--+...
+    %                |1 | 2| 3| 4| 5| 6| 7| 8| 9|...  (NEW BLOCK)
+    %                +--+--+--+--+--+--+--+--+--+...
+    %                             ^^
+    %                          trim_left
+    %
+    % Want to cut off the first 4 samples of the new block which overlap with
+    % what we already calculated. That means left_trim needs to be '5'.
+    %
+    % trim_left = this.Latest - left_bound + 2; < - gives desired result.
+    % I.e. trim_left = 18 - 15 + 2 = 5 <- correct.
+    %
+    % ARGH.
+    trim_left = this.Latest - left_bound + 2;
+end
+
+trim_right = min ( imin_copy(end-RIGHT_TRIM_NUMEXTR), imax_copy(end-RIGHT_TRIM_NUMEXTR) );
+
+%% "Check block overlap identical"
+if ( this.config ('IMF:SIFT_BLOCK:DEBUG:DISPLAY_BLOCK_OVERLAP_DIAGNOSTIC') )
+    Debug_Block_Overlap_Identical();
+end
+
+%% Update saved mode and residue.
+Update_Stored_Data(this, mode(trim_left:trim_right), res(trim_left:trim_right));
+
+%% Make a pretty plot.
+if ( this.config('IMF:SIFT_BLOCK:DEBUG:DISPLAY_EACH_BLOCK') )
+    Debug_Output();
+end
+
+if ( this.config('IMF:SIFT_BLOCK:DEBUG:PROGRESS_OUTPUT') )
+    t = toc;
+    fprintf(' ... done. %9.6f seconds.\n',t);
+end
+
+
+
+%% Worker functions
+    function Mirrorize_Extrema()
+        if     ( imax(1) < imin (1) )
+            if ( d(n,1) > vmin(1) )
+                % Case 1: * First extrema was a maxima.
+                %         * Signal starts off higher than first minima.
+                % |   x       x       x
+                % |  / \     / \     / \
+                % |_/   \   /   \   /
+                % |      \ /     \ /
+                % |       x       x
+                %
+                % Mirror all extrema around the first maxima.
+                mirror = imax(1);
+                left_imin = 2*mirror - fliplr(imin);
+                left_vmin = fliplr ( vmin );
+                left_imax = 2*mirror - fliplr(imax(2:end));
+                left_vmax = fliplr ( vmax(2:end) );
+            else
+                % Case 2: * First extrema was a maxima.
+                %         * Signal starts off lower than first minima.
+                %
+                %  |   x   X   x   x   x
+                %  |  / \ / \ / \ / \ /
+                %  | /   x   x   x   x
+                %  |/
+                %  |
+                %
+                % Mirror all extrema around the origin, and add an extra minima
+                % at the origin.
+                mirror = 1;
+                left_imin = 2*mirror - [ fliplr(imin), 1 ];
+                left_vmin = [ fliplr(vmin), d(n,1) ];
+                left_imax = 2*mirror - fliplr (imax);
+                left_vmax = fliplr (vmax);
+            end
+            
+        elseif ( imax(1) > imin (1) )
+            if ( d(n,1) < vmax(1) )
+                % Case 3: * First extrema was a minima.
+                %         * Signal starts off lower than first maxima.
+                %
+                % |     x     x     x
+                % |_   / \   / \   / \
+                % | \ /   \ /   \ /   \
+                % |  x     x     x     x
+                %
+                % Mirror all extrema around the first minima.
+                mirror = imin(1);
+                left_imin = 2*mirror - fliplr( imin(2:end) );
+                left_vmin = fliplr ( vmin(2:end) );
+                left_imax = 2*mirror - fliplr ( imax );
+                left_vmax = fliplr ( vmax );
+                
+            else
+                % Case 4: * First extrema was a minima.
+                %         * Signal starts off higher than first maxima.
+                % |\
+                % | \     x     x     x
+                % |  \   / \   / \   / \
+                % |   \ /   \ /   \ /   \
+                % |    x     x     x     x
+                %
+                % Mirror all extrema around the origin, and add an extra maxima
+                % at the origin.
+                mirror = 1;
+                left_imin = 2*mirror - fliplr(imin);
+                left_vmin = fliplr(vmin);
+                left_imax = 2*mirror - [ fliplr(imax), 1 ];
+                left_vmax = [ fliplr(vmax), d(n,1) ];
+                
+            end
+        else
+            assert(0);
+        end
+        
+        d_end = size(d,2);
+        if     ( imax(end) > imin(end) )            
+            if ( d(n,end) < vmin(end) )
+                % Case 1: * Last extrema was a maxima
+                %         * Signal finished lower than the last minima.
+                %
+                % Means: Signal was trending downwards.
+                %
+                % Add an extra minima at the end of the signal (right bound),
+                % and then mirror all extrema around the right bound.
+                mirror = d_end;
+                right_imin = 2*mirror - [ d_end, fliplr(imin) ];
+                right_vmin = [ d(n,end), fliplr(vmin) ];
+                right_imax = 2*mirror - fliplr(imax);
+                right_vmax = fliplr(vmax);
+%                 disp 'case 1'
+            else
+                % Case 2: * Last extrema was a maxima.
+                %         * Signal finished above last minima.
+                %
+                % Means: Signal was trending steady.
+                %
+                % Mirror all extrema around the last extrema.
+                mirror = imax(end);
+                right_imin = 2*mirror - fliplr(imin);
+                right_vmin = fliplr (vmin);
+                right_imax = 2*mirror - fliplr(imax(1:end-1));
+                right_vmax = fliplr(vmax(1:end-1));
+%                 disp 'case 2'
+            end
+        elseif ( imax(end) < imin(end) )
+            if ( d(n,end) > vmax(end) )
+                % Case 3: * Last extrema was a minima
+                %         * Signal finished higher than last maxima
+                %
+                % Means: Signal was trending upwards.
+                %
+                % Add an extrea maxima at the signal end and then mirror all
+                % other extrema around it.
+                mirror = d_end;
+                right_imin = 2*mirror - fliplr(imin);
+                right_vmin = fliplr(vmin);
+                right_imax = 2*mirror - [ d_end, fliplr(imax) ];
+                right_vmax = [d(n,end), fliplr(vmax)];
+%                 disp 'case 3'
+            else
+                % Case 4: * Last extrema was a minima.
+                %         * Signal finished lower than last maxima.
+                %
+                % Means: Signal was trending steady.
+                %
+                % Mirror all extrema around the last extrema.
+                mirror = imin(end);
+                right_imin = 2*mirror - fliplr( imin(1:end-1) );
+                right_vmin = fliplr ( vmin(1:end-1) );
+                right_imax = 2*mirror - fliplr( imax );
+                right_vmax = fliplr(vmax);
+%                 disp 'case 4'
+            end
+        else
+            assert(0);
+        end
+        
+        imin = [ left_imin, imin, right_imin ];
+        imax = [ left_imax, imax, right_imax ];
+        vmin = [ left_vmin, vmin, right_vmin ];
+        vmax = [ left_vmax, vmax, right_vmax ];
+        
+        % Assert that all extrema are unique.
+        assert( numel(imin) == numel(unique(imin)) );
+        assert( numel(imax) == numel(unique(imax)) );
+        
+        % Assert vectors of indecies and values are same length.
+        assert( numel(imin) == numel (vmin) );
+        assert( numel(imax) == numel (vmax) );
+        
+        % Assert that the extrema extend back far enough to kill end effects.
+        assert( imin(1) < left_bound );
+        assert( imax(1) < left_bound );
+        
+    end
+
+%% Debug output functions
+    function Debug_Show_Sifting_Step()
+        figure (44);
+        plot(...
+            spline_t, env_min , 'c',...
+            spline_t, env_max , 'c',...
+            spline_t, env_mean, 'c',...
+            spline_t, d(n,:)  , 'b',...
+            spline_t, d(n+1,:), 'r',...
+            imin,vmin,'rx', ...
+            imax,vmax,'mx'...
+            );
+        pause;
+    end
+
+    function Debug_Block_Overlap_Identical()
+        if (this.Earliest ~= 0)
+            figure(45);
+            
+            subplot(4,1,1)
+            plot( ...
+                this.Earliest:this.Latest, this.GetMode(this.Earliest,this.Latest), 'b', ...
+                left_bound:right_bound, mode, 'r');
+            vline( [trim_left,trim_right]+offset, 'm' );
+            set(gca,'XLim',[this.Earliest,right_bound]);
+            
+            subplot(4,1,2)
+            plot(this.Earliest:this.Latest, this.GetMode(this.Earliest,this.Latest), 'b');
+            vline( [trim_left,trim_right]+offset, 'm' );
+            set(gca,'XLim',[this.Earliest,right_bound]);
+            
+            subplot(4,1,3)
+            plot(left_bound:right_bound, mode, 'r');
+            vline( [trim_left,trim_right]+offset, 'm' );
+            set(gca,'XLim',[this.Earliest,right_bound]);
+            
+            subplot(4,1,4)
+            
+            %             this.Earliest           this.Latest
+            %                   v                      v
+            % Existing mode     ~~~~~~~~~~~~~~~~~~~~~~~~
+            % Newly calculated                 ~~~~~~~~~~~~~~~~~~~~~~~~
+            %                                  ^                      ^
+            %                              left_bound              right_bound
+            
+            t2 = left_bound:this.Latest;
+            existing = this.GetMode(left_bound,this.Latest);
+            new_calc = mode(1:this.Latest-(left_bound-this.Earliest));
+            semilogy(t2, abs(new_calc - existing));
+            
+            
+            
+            vline( [trim_left,trim_right]+offset, 'm' );
+            set(gca,'XLim',[this.Earliest,right_bound]);
+            
+            pause;
+        end
+    end
+
+    function Debug_Output()
+        this
+        figure (42);
+        hold off;
+        plot ( ...
+            1:length(x)   , x   , 'c', ...
+            1:length(mode), mode, 'r', ...
+            1:length(env_min), env_min, 'c', ...
+            1:length(env_max), env_max, 'c', ...
+            1:length(res) , res , 'm');
+        legend ('Input signal','IMF','residue');
+        vline ([trim_left, trim_right],'g'); % Mark the trimming positions.
+        
+        if ( this.mode_num == 2 )
+            figure (43)
+            plot (d');
+            
+            pause
+        end
+    end
+end
+
+function interpolated = Interpolate(ind,val,time_array,this)
+% Interpolates the given points at the times specified in time_array. (Like
+% spline(x,y,xx).
+% Chooses a method based on the setting in Lws_Config.m.
+switch ( this.config('IMF:SIFT_BLOCK:ENVELOPE_INTERPOLATION_METHOD') )
+    case 'Hermite'
+        interpolated = hermite_spline(ind,val,time_array);
+    case 'PCHIP'
+        interpolated = pchip(ind,val,time_array);
+    case 'Cubic'
+        interpolated = spline(ind,val,time_array);
+end
+end
+
+function Update_Stored_Data ( this, new_mode_data, new_residue_data)
+assert ( numel(new_mode_data) == numel (new_residue_data), 'Vectors must be same length.' );
+num_samples = numel(new_mode_data);
+
+% This is done verbosely because doing it the elegant way resulted in a bug. For
+% no apparent reason. I LOVE MATLAB!!!! (Not.)
+tempvar = horzcat (this.residue, new_residue_data);
+this.residue = tempvar;
+tempvar = horzcat( this.mode, new_mode_data);
+this.mode = tempvar;
+
+% This will be true the first time we add data, because Earliest and Latest are
+% initialised to zero.
+if (this.Earliest == 0)
+    this.SetEarliest(1);
+end
+
+this.SetLatest( this.Latest + num_samples );
+
+% Note : right now the IMF object stores all data since the dawn of time (i.e.
+% might run out memory.) Remove this assert when I get around to converting the
+% IMF storage to a finite-length buffer.
+assert ( numel(this.mode) == this.Latest - this.Earliest + 1 );
+
+end
+
