@@ -21,13 +21,13 @@ tplot(Wx, t, as); colorbar; title('CWT','FontSize',14); xlabel('Time (seconds)',
 figure(); plot(t,[x,xNew]);
 %}
 
-% Short-time Fourier transform (STFT)
-%{
+%Short-time Fourier transform (STFT)
+
 [Sx,fs,dSx] = stft_fw(x, dt, STFTopt);
 xNew = stft_iw(Sx, fs, STFTopt).';
 tplot(Sx, t, fs); colorbar; title('STFT','FontSize',14); xlabel('Time (seconds)','FontSize',14); ylabel('Frequency (hz)', 'FontSize',14);
-figure(); plot(t,[x,xNew]);
-%}
+figure(); plot(t,[x,xNew]);grid;title('Reconstructed Signal from STFT');
+
 
 % CWT Synchrosqueezing transform
 %{
@@ -38,12 +38,12 @@ figure(); plot(t,[x,xNew(:,1)]);
 %}
 
 % STFT Synchrosqueezing transform
-%{
+
 [Tx, fs, Sx, Sfs, Sw, dSx] = synsq_stft_fw(t, x, STFTopt);	
 xNew = synsq_stft_iw(Tx, fs, STFTopt).';
 figure(); tplot(Tx, t, fs); colorbar; title('STFT Synchrosqueezing','FontSize',14); xlabel('Time (seconds)','FontSize',14); ylabel('Frequency (hz)', 'FontSize',14);
-figure(); plot(t,[x,xNew(:,1)])
-%}
+figure(); plot(t,[x,xNew(:,1)]);grid;title('Reconstructed X(t) from ISSSTFT');
+
 
 
 % Blind source separation using STFT Synchrosqueezing transform
